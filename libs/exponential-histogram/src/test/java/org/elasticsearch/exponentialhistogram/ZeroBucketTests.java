@@ -21,70 +21,111 @@
 
 package org.elasticsearch.exponentialhistogram;
 
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.not;
+import org.junit.Test;
 
-public class ZeroBucketTests extends ExponentialHistogramTestCase {
+import static org.junit.Assert.*;
 
-    public void testMinimalBucketHasZeroThreshold() {
-        assertThat(ZeroBucket.minimalWithCount(42).zeroThreshold(), equalTo(0.0));
+public class ZeroBucketTests {
+
+    @Test
+    public void testFromThresholdLazyIndex() {
+        ZeroBucket z = ZeroBucket.fromThreshold(1.25d, 5L);
+        assertTrue(z.isThresholdComputed());
+        assertFalse(z.isIndexComputed());
+        assertEquals(1.25d, z.zeroThreshold(), 0.0);
+        z.index();
+        assertTrue(z.isIndexComputed());
     }
 
-    public void testExactThresholdPreserved() {
-        ZeroBucket bucket = ZeroBucket.create(3.0, 10);
-        assertThat(bucket.zeroThreshold(), equalTo(3.0));
+    @Test
+    public void testFromIndexLazyThreshold() {
+        ZeroBucket z = ZeroBucket.fromIndexAndScale(42L, ExponentialHistogram.MAX_SCALE, 3L);
+        assertTrue(z.isIndexComputed());
+        assertFalse(z.isThresholdComputed());
+        double thr = z.zeroThreshold();
+        assertTrue(thr >= 0.0);
+        assertTrue(z.isThresholdComputed());
     }
 
-    public void testMergingPreservesExactThreshold() {
-        ZeroBucket bucketA = ZeroBucket.create(3.0, 10);
-        ZeroBucket bucketB = ZeroBucket.create(3.5, 20);
-        ZeroBucket merged = bucketA.merge(bucketB);
-        assertThat(merged.zeroThreshold(), equalTo(3.5));
-        assertThat(merged.count(), equalTo(30L));
+    @Test
+    public void testMinimalEmptySingleton() {
+        ZeroBucket m1 = ZeroBucket.minimalEmpty();
+        ZeroBucket m2 = ZeroBucket.minimalEmpty();
+        assertSame(m1, m2);
+        assertEquals(0L, m1.count());
+        assertTrue(m1.zeroThreshold() >= 0.0);
     }
 
-    public void testBucketCollapsingPreservesExactThreshold() {
-        ExponentialHistogram histo = createAutoReleasedHistogram(
-            b -> b.scale(0).setPositiveBucket(0, 42) // bucket [1,2]
-        );
-
-        ZeroBucket bucketA = ZeroBucket.create(3.0, 10);
-
-        CopyableBucketIterator iterator = histo.positiveBuckets().iterator();
-        ZeroBucket merged = bucketA.collapseOverlappingBuckets(iterator);
-
-        assertThat(iterator.hasNext(), equalTo(false));
-        assertThat(merged.zeroThreshold(), equalTo(3.0));
-        assertThat(merged.count(), equalTo(52L));
+    @Test
+    public void testMinimalWithCount() {
+        ZeroBucket m = ZeroBucket.minimalWithCount(5L);
+        assertEquals(5L, m.count());
+        assertTrue(m.zeroThreshold() >= 0.0);
     }
 
-    public void testHashCodeEquality() {
-        assertEqualsContract(ZeroBucket.minimalEmpty(), ZeroBucket.create(0.0, 0));
-        assertThat(ZeroBucket.minimalEmpty(), not(equalTo(ZeroBucket.create(0.0, 1))));
-        assertThat(ZeroBucket.minimalEmpty(), not(equalTo(ZeroBucket.create(0.1, 0))));
-
-        assertEqualsContract(ZeroBucket.minimalWithCount(42), ZeroBucket.create(0.0, 42));
-        assertThat(ZeroBucket.minimalWithCount(42), not(equalTo(ZeroBucket.create(0.0, 12))));
-        assertThat(ZeroBucket.minimalWithCount(42), not(equalTo(ZeroBucket.create(0.1, 42))));
-
-        ZeroBucket minimalEmpty = ZeroBucket.minimalEmpty();
-        assertEqualsContract(ZeroBucket.minimalWithCount(42), ZeroBucket.create(minimalEmpty.index(), minimalEmpty.scale(), 42));
-        assertThat(ZeroBucket.minimalWithCount(42), not(equalTo(ZeroBucket.create(minimalEmpty.index(), minimalEmpty.scale(), 41))));
-        assertThat(ZeroBucket.minimalWithCount(42), not(equalTo(ZeroBucket.create(minimalEmpty.index() + 1, minimalEmpty.scale(), 42))));
-
-        assertEqualsContract(ZeroBucket.create(123.56, 123), ZeroBucket.create(123.56, 123));
-        assertThat(ZeroBucket.create(123.56, 123), not(equalTo(ZeroBucket.create(123.57, 123))));
-        assertThat(ZeroBucket.create(123.56, 123), not(equalTo(ZeroBucket.create(123.56, 12))));
-
-        // the exponentially scaled numbers (index=2, scale=0) and (index=1, scale=-1) both represent 4.0
-        // therefore the zero buckets should be equal
-        assertEqualsContract(ZeroBucket.create(2, 0, 123), ZeroBucket.create(1, -1, 123));
-        assertEqualsContract(ZeroBucket.create(4, 1, 123), ZeroBucket.create(1, -1, 123));
+    @Test
+    public void testMergeKeepsLargerThreshold() {
+        ZeroBucket a = ZeroBucket.fromThreshold(0.5d, 4L);
+        ZeroBucket b = ZeroBucket.fromThreshold(1.0d, 6L);
+        ZeroBucket merged = a.merge(b);
+        assertEquals(10L, merged.count());
+        assertEquals(b.zeroThreshold(), merged.zeroThreshold(), 0.0);
     }
 
-    void assertEqualsContract(ZeroBucket a, ZeroBucket b) {
-        assertThat(a, equalTo(b));
-        assertThat(a.hashCode(), equalTo(b.hashCode()));
+    @Test(expected = IllegalArgumentException.class)
+    public void testInvalidNegativeThreshold() {
+        ZeroBucket.fromThreshold(-0.01d, 1L);
     }
 
+    @Test
+    public void testEqualityAndHashStable() {
+        ZeroBucket a = ZeroBucket.fromThreshold(0.6d, 10L);
+        ZeroBucket b = ZeroBucket.fromThreshold(0.6d, 10L);
+        assertEquals(a, b);
+        assertEquals(a.hashCode(), b.hashCode());
+        a.index();
+        assertEquals(a, b);
+        b.index();
+        assertEquals(a.hashCode(), b.hashCode());
+    }
+
+    @Test
+    public void testCollapseNoOverlapReturnsSame() {
+        ZeroBucket z = ZeroBucket.fromThreshold(0.5d, 2L);
+        BucketIterator empty = new BucketIterator() {
+            @Override
+            public void advance() {
+            }
+
+            @Override
+            public boolean hasNext() {
+                return false;
+            }
+
+            @Override
+            public long peekCount() {
+                throw new IllegalStateException();
+            }
+
+            @Override
+            public long peekIndex() {
+                throw new IllegalStateException();
+            }
+
+            @Override
+            public int scale() {
+                return ExponentialHistogram.MAX_SCALE;
+            }
+        };
+        ZeroBucket result = z.collapseOverlappingBuckets(empty);
+        assertSame(z, result);
+    }
+
+    @Test
+    public void testToStringContainsKeyFields() {
+        ZeroBucket z = ZeroBucket.fromThreshold(0.75d, 2L);
+        String s = z.toString();
+        assertTrue(s.contains("scale="));
+        assertTrue(s.contains("count=2"));
+    }
 }

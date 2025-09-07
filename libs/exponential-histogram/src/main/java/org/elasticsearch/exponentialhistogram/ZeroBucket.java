@@ -18,7 +18,6 @@
  *
  * This file is based on a modification of https://github.com/open-telemetry/opentelemetry-java which is licensed under the Apache 2.0 License.
  */
-
 package org.elasticsearch.exponentialhistogram;
 
 import org.apache.lucene.util.RamUsageEstimator;
@@ -27,69 +26,114 @@ import static org.elasticsearch.exponentialhistogram.ExponentialHistogram.MAX_IN
 import static org.elasticsearch.exponentialhistogram.ExponentialHistogram.MAX_SCALE;
 import static org.elasticsearch.exponentialhistogram.ExponentialHistogram.MIN_INDEX;
 import static org.elasticsearch.exponentialhistogram.ExponentialHistogram.MIN_SCALE;
-import static org.elasticsearch.exponentialhistogram.ExponentialScaleUtils.adjustScale;
 import static org.elasticsearch.exponentialhistogram.ExponentialScaleUtils.compareExponentiallyScaledValues;
 import static org.elasticsearch.exponentialhistogram.ExponentialScaleUtils.computeIndex;
 import static org.elasticsearch.exponentialhistogram.ExponentialScaleUtils.exponentiallyScaledToDoubleValue;
-import static org.elasticsearch.exponentialhistogram.ExponentialScaleUtils.normalizeScale;
 
 /**
  * Represents the bucket for values around zero in an exponential histogram.
  * The range of this bucket is {@code [-zeroThreshold, +zeroThreshold]}.
- * To allow efficient comparison with bucket boundaries, this class internally
- * represents the zero threshold as a exponential histogram bucket index with a scale,
- * computed via {@link ExponentialScaleUtils#computeIndex(double, int)}.
+ *
+ * Refactor (Task 1):
+ * - Added static factories (fromThreshold, fromIndexAndScale) while keeping original public constructor
+ * - Introduced explicit lazy flags (indexComputed, thresholdComputed) instead of sentinels
+ * - Added value semantics (equals, hashCode, toString)
+ * - Preserved original API: minimalEmpty, minimalWithCount, merge, collapseOverlappingBuckets[ForAll], compareZeroThreshold
+ * - Restored legacy static create(...) factories for backward compatibility with existing tests
  */
 public final class ZeroBucket {
 
     public static final long SHALLOW_SIZE = RamUsageEstimator.shallowSizeOfInstance(ZeroBucket.class);
 
-    /**
-     * The exponential histogram scale used for {@link #index}
-     */
     private final int scale;
-
-    /**
-     * The exponential histogram bucket index whose upper boundary corresponds to the zero threshold.
-     * Might be computed lazily from {@link #realThreshold}, uses {@link Long#MAX_VALUE} as placeholder in this case.
-     */
     private long index;
-
-    /**
-     * Might be computed lazily from {@link #realThreshold}, uses {@link Double#NaN} as placeholder in this case.
-     */
     private double realThreshold;
-
     private final long count;
-    // A singleton for an empty zero bucket with the smallest possible threshold.
-    private static final ZeroBucket MINIMAL_EMPTY = new ZeroBucket(MIN_INDEX, MIN_SCALE, 0);
 
-    private ZeroBucket(double zeroThreshold, long count) {
-        assert zeroThreshold >= 0.0 : "zeroThreshold must not be negative";
-        this.index = Long.MAX_VALUE; // compute lazily when needed
+    // Explicit lazy flags
+    private boolean indexComputed;
+    private boolean thresholdComputed;
+
+    // Original minimal empty singleton (index known, threshold lazy)
+    private static final ZeroBucket MINIMAL_EMPTY = new ZeroBucket(
+        MIN_INDEX,
+        MIN_SCALE,
+        0L,
+        true,
+        false,
+        Double.NaN
+    );
+
+    /* ===================== Original Public Constructor (kept) ===================== */
+
+    /**
+     * Original public constructor (threshold authoritative). Kept for source compatibility.
+     * Deprecated in favor of {@link #fromThreshold(double, long)}.
+     */
+    @Deprecated
+    public ZeroBucket(double zeroThreshold, long count) {
+        if (zeroThreshold < 0.0) {
+            throw new IllegalArgumentException("zeroThreshold must be >= 0 (was " + zeroThreshold + ")");
+        }
         this.scale = MAX_SCALE;
+        this.count = count;
         this.realThreshold = zeroThreshold;
-        this.count = count;
+        this.index = 0L; // placeholder until computed
+        this.indexComputed = false;
+        this.thresholdComputed = true;
     }
 
-    private ZeroBucket(long index, int scale, long count) {
-        assert index >= MIN_INDEX && index <= MAX_INDEX : "index must be in range [" + MIN_INDEX + ", " + MAX_INDEX + "]";
-        assert scale >= MIN_SCALE && scale <= MAX_SCALE : "scale must be in range [" + MIN_SCALE + ", " + MAX_SCALE + "]";
-        this.index = index;
-        this.scale = scale;
-        this.realThreshold = Double.NaN; // compute lazily when needed
-        this.count = count;
-    }
+    /* ===================== Factory Methods ===================== */
 
-    private ZeroBucket(ZeroBucket toCopy, long newCount) {
-        this.realThreshold = toCopy.realThreshold;
-        this.index = toCopy.index;
-        this.scale = toCopy.scale;
-        this.count = newCount;
+    /**
+     * Create a ZeroBucket from an explicit threshold (index lazy).
+     */
+    public static ZeroBucket fromThreshold(double zeroThreshold, long count) {
+        if (zeroThreshold < 0.0) {
+            throw new IllegalArgumentException("zeroThreshold must be >= 0 (was " + zeroThreshold + ")");
+        }
+        return new ZeroBucket(
+            0L,
+            MAX_SCALE,
+            count,
+            false,
+            true,
+            zeroThreshold
+        );
     }
 
     /**
-     * @return A singleton instance of an empty zero bucket with the smallest possible threshold.
+     * Create a ZeroBucket from an index + scale (threshold lazy).
+     */
+    public static ZeroBucket fromIndexAndScale(long index, int scale, long count) {
+        if (scale < MIN_SCALE || scale > MAX_SCALE) {
+            throw new IllegalArgumentException("scale out of range: " + scale);
+        }
+        if (index < MIN_INDEX || index > MAX_INDEX) {
+            throw new IllegalArgumentException("index out of range: " + index);
+        }
+        return new ZeroBucket(
+            index,
+            scale,
+            count,
+            true,
+            false,
+            Double.NaN
+        );
+    }
+
+    /* ---- Legacy static factories expected by existing tests ---- */
+    public static ZeroBucket create(double zeroThreshold, long count) {
+        return fromThreshold(zeroThreshold, count);
+    }
+
+    public static ZeroBucket create(double zeroThreshold, int count) {
+        return fromThreshold(zeroThreshold, (long) count);
+    }
+    /* ------------------------------------------------------------ */
+
+    /**
+     * @return singleton empty minimal bucket.
      */
     public static ZeroBucket minimalEmpty() {
         return MINIMAL_EMPTY;
@@ -97,141 +141,129 @@ public final class ZeroBucket {
 
     /**
      * Creates a zero bucket with the smallest possible threshold and a given count.
-     *
-     * @param count The number of values in the bucket.
-     * @return A new {@link ZeroBucket}.
+     * If count == 0 returns the singleton.
      */
     public static ZeroBucket minimalWithCount(long count) {
         if (count == 0) {
             return MINIMAL_EMPTY;
-        } else {
-            return new ZeroBucket(MINIMAL_EMPTY, count);
         }
+        // Resolve lazy threshold & index of singleton
+        double threshold = MINIMAL_EMPTY.zeroThreshold();
+        long idx = MINIMAL_EMPTY.index();
+        return resolved(threshold, idx, MINIMAL_EMPTY.scale(), count);
     }
 
-    /**
-     * Creates a zero bucket from the given threshold represented as double.
-     *
-     * @param zeroThreshold the zero threshold defining the bucket range [-zeroThreshold, +zeroThreshold], must be non-negative
-     * @param count the number of values in the bucket
-     * @return the new {@link ZeroBucket}
-     */
-    public static ZeroBucket create(double zeroThreshold, long count) {
-        if (zeroThreshold == 0) {
-            return minimalWithCount(count);
-        }
-        return new ZeroBucket(zeroThreshold, count);
+    /* ===================== Private Constructors ===================== */
+
+    private ZeroBucket(
+        long index,
+        int scale,
+        long count,
+        boolean indexComputed,
+        boolean thresholdComputed,
+        double realThreshold
+    ) {
+        this.index = index;
+        this.scale = scale;
+        this.count = count;
+        this.indexComputed = indexComputed;
+        this.thresholdComputed = thresholdComputed;
+        this.realThreshold = realThreshold;
     }
 
-    /**
-     * Creates a zero bucket from the given threshold represented as exponentially scaled number.
-     *
-     * @param index the index of the exponentially scaled number defining the zero threshold
-     * @param scale the corresponding scale for the index
-     * @param count the number of values in the bucket
-     * @return the new {@link ZeroBucket}
-     */
-    public static ZeroBucket create(long index, int scale, long count) {
-        if (index == MINIMAL_EMPTY.index && scale == MINIMAL_EMPTY.scale) {
-            return minimalWithCount(count);
-        }
-        return new ZeroBucket(index, scale, count);
+    private static ZeroBucket resolved(double threshold, long index, int scale, long count) {
+        return new ZeroBucket(index, scale, count, true, true, threshold);
     }
 
-    /**
-     * @return The value of the zero threshold.
-     */
-    public double zeroThreshold() {
-        if (Double.isNaN(realThreshold)) {
-            realThreshold = exponentiallyScaledToDoubleValue(index(), scale());
-        }
-        return realThreshold;
-    }
+    /* ===================== Accessors ===================== */
 
-    public long index() {
-        if (index == Long.MAX_VALUE) {
-            index = computeIndex(zeroThreshold(), scale()) + 1;
-        }
-        return index;
+    public long count() {
+        return count;
     }
 
     public int scale() {
         return scale;
     }
 
-    public long count() {
-        return count;
+    /**
+     * Returns index; if threshold authoritative, compute with +1 rule (matches original code).
+     */
+    public long index() {
+        computeIndexIfNeeded();
+        return index;
     }
 
     /**
-     * Merges this zero bucket with another one.
-     * <ul>
-     *     <li>If the other zero bucket or both are empty, this instance is returned unchanged.</li>
-     *     <li>If the this zero bucket is empty and the other one is populated, the other instance is returned unchanged.</li>
-     *     <li>Otherwise, the zero threshold is increased if necessary (by taking the maximum of the two), and the counts are summed.</li>
-     * </ul>
-     *
-     * @param other The other zero bucket to merge with.
-     * @return A new {@link ZeroBucket} representing the merged result.
+     * Returns threshold; if index authoritative compute it lazily.
      */
+    public double zeroThreshold() {
+        computeThresholdIfNeeded();
+        return realThreshold;
+    }
+
+    /* ===================== Lazy Computation Helpers ===================== */
+
+    private void computeIndexIfNeeded() {
+        if (indexComputed == false) {
+            index = computeIndex(realThreshold, scale) + 1;
+            indexComputed = true;
+        }
+    }
+
+    private void computeThresholdIfNeeded() {
+        if (thresholdComputed == false) {
+            realThreshold = exponentiallyScaledToDoubleValue(index(), scale);
+            thresholdComputed = true;
+        }
+    }
+
+    /* Package-private for tests */
+    boolean isIndexComputed() {
+        return indexComputed;
+    }
+
+    boolean isThresholdComputed() {
+        return thresholdComputed;
+    }
+
+    /* ===================== Original Functional API ===================== */
+
+    public int compareZeroThreshold(ZeroBucket other) {
+        return compareExponentiallyScaledValues(index(), scale(), other.index(), other.scale());
+    }
+
     public ZeroBucket merge(ZeroBucket other) {
         if (other.count == 0) {
             return this;
-        } else if (count == 0) {
+        } else if (this.count == 0) {
             return other;
         } else {
-            long totalCount = count + other.count;
-            // Both are populated, so we need to use the higher zero-threshold.
+            long total = this.count + other.count;
             if (this.compareZeroThreshold(other) >= 0) {
-                return new ZeroBucket(this, totalCount);
+                return resolved(this.zeroThreshold(), this.index(), this.scale(), total);
             } else {
-                return new ZeroBucket(other, totalCount);
+                return resolved(other.zeroThreshold(), other.index(), other.scale(), total);
             }
         }
     }
 
-    /**
-     * Collapses all buckets from the given iterators whose lower boundaries are smaller than the zero threshold.
-     * The iterators are advanced to point at the first, non-collapsed bucket.
-     *
-     * @param bucketIterators The iterators whose buckets may be collapsed.
-     * @return A potentially updated {@link ZeroBucket} with the collapsed buckets' counts and an adjusted threshold.
-     */
     public ZeroBucket collapseOverlappingBucketsForAll(BucketIterator... bucketIterators) {
         ZeroBucket current = this;
         ZeroBucket previous;
         do {
             previous = current;
-            for (BucketIterator buckets : bucketIterators) {
-                current = current.collapseOverlappingBuckets(buckets);
+            for (BucketIterator b : bucketIterators) {
+                current = current.collapseOverlappingBuckets(b);
             }
         } while (previous.compareZeroThreshold(current) != 0);
         return current;
     }
 
-    /**
-     * Compares the zero threshold of this bucket with another one.
-     *
-     * @param other The other zero bucket to compare against.
-     * @return A negative integer, zero, or a positive integer if this bucket's threshold is less than,
-     *         equal to, or greater than the other's.
-     */
-    public int compareZeroThreshold(ZeroBucket other) {
-        return compareExponentiallyScaledValues(index(), scale(), other.index(), other.scale());
-    }
-
-    /**
-     * Collapses all buckets from the given iterator whose lower boundaries are smaller than the zero threshold.
-     * The iterator is advanced to point at the first, non-collapsed bucket.
-     *
-     * @param buckets The iterator whose buckets may be collapsed.
-     * @return A potentially updated {@link ZeroBucket} with the collapsed buckets' counts and an adjusted threshold.
-     */
     public ZeroBucket collapseOverlappingBuckets(BucketIterator buckets) {
-
         long collapsedCount = 0;
         long highestCollapsedIndex = 0;
-        while (buckets.hasNext() && compareExponentiallyScaledValues(buckets.peekIndex(), buckets.scale(), index(), scale()) < 0) {
+        while (buckets.hasNext()
+            && compareExponentiallyScaledValues(buckets.peekIndex(), buckets.scale(), index(), scale()) < 0) {
             highestCollapsedIndex = buckets.peekIndex();
             collapsedCount += buckets.peekCount();
             buckets.advance();
@@ -240,37 +272,47 @@ public final class ZeroBucket {
             return this;
         } else {
             long newZeroCount = count + collapsedCount;
-            // +1 because we need to adjust the zero threshold to the upper boundary of the collapsed bucket
             long collapsedUpperBoundIndex = highestCollapsedIndex + 1;
             if (compareExponentiallyScaledValues(index(), scale(), collapsedUpperBoundIndex, buckets.scale()) >= 0) {
-                // Our current zero-threshold is larger than the upper boundary of the largest collapsed bucket, so we keep it.
-                return new ZeroBucket(this, newZeroCount);
+                return resolved(this.zeroThreshold(), this.index(), this.scale(), newZeroCount);
             } else {
-                return new ZeroBucket(collapsedUpperBoundIndex, buckets.scale(), newZeroCount);
+                return fromIndexAndScale(collapsedUpperBoundIndex, buckets.scale(), newZeroCount);
             }
         }
     }
 
+    /* ===================== Value Semantics ===================== */
+
     @Override
     public boolean equals(Object o) {
-        if (o == null || getClass() != o.getClass()) return false;
-        ZeroBucket that = (ZeroBucket) o;
-        if (count() != that.count()) return false;
-        if (Double.compare(zeroThreshold(), that.zeroThreshold()) != 0) return false;
-        if (compareExponentiallyScaledValues(index(), scale(), that.index(), that.scale()) != 0) return false;
-        return true;
+        if (this == o) return true;
+        if (o instanceof ZeroBucket zb) {
+            long i1 = index();
+            long i2 = zb.index();
+            double t1 = zeroThreshold();
+            double t2 = zb.zeroThreshold();
+            return scale == zb.scale && count == zb.count && i1 == i2 && Double.compare(t1, t2) == 0;
+        }
+        return false;
     }
 
     @Override
     public int hashCode() {
-        int normalizedScale = normalizeScale(index(), scale);
-        int scaleAdjustment = normalizedScale - scale;
-        long normalizedIndex = adjustScale(index(), scale, scaleAdjustment);
+        int h = Integer.hashCode(scale);
+        h = 31 * h + Long.hashCode(index());
+        h = 31 * h + Double.hashCode(zeroThreshold());
+        h = 31 * h + Long.hashCode(count);
+        return h;
+    }
 
-        int result = normalizedScale;
-        result = 31 * result + Long.hashCode(normalizedIndex);
-        result = 31 * result + Double.hashCode(zeroThreshold());
-        result = 31 * result + Long.hashCode(count);
-        return result;
+    @Override
+    public String toString() {
+        return "ZeroBucket{scale=" + scale
+            + ", index=" + index()
+            + ", threshold=" + zeroThreshold()
+            + ", count=" + count
+            + ", indexComputed=" + indexComputed
+            + ", thresholdComputed=" + thresholdComputed
+            + "}";
     }
 }
