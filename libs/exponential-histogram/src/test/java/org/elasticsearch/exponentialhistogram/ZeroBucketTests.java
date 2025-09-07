@@ -53,7 +53,8 @@ public class ZeroBucketTests {
         ZeroBucket m2 = ZeroBucket.minimalEmpty();
         assertSame(m1, m2);
         assertEquals(0L, m1.count());
-        assertTrue(m1.zeroThreshold() >= 0.0);
+        double threshold = m1.zeroThreshold();
+        assertTrue("threshold should be non-negative", threshold >= 0.0);
     }
 
     @Test
@@ -92,6 +93,7 @@ public class ZeroBucketTests {
     @Test
     public void testCollapseNoOverlapReturnsSame() {
         ZeroBucket z = ZeroBucket.fromThreshold(0.5d, 2L);
+        // Empty iterator scenario -> remains same
         BucketIterator empty = new BucketIterator() {
             @Override
             public void advance() {
